@@ -5,16 +5,15 @@ from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 
-# ============================================================
-# 1. KONFIGURACJA APLIKACJI
-# ============================================================
+
+# configuration
 st.set_page_config(
-    page_title="Global Market AI", 
+    page_title="Market Analysis and Pricing Agent", 
     page_icon="🌍", 
     layout="centered"
 )
 
-# Pobieranie kluczy
+# keys
 GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
 TAVILY_KEY = st.secrets.get("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY"))
 
@@ -24,9 +23,7 @@ if not GEMINI_KEY or not TAVILY_KEY:
 
 client = genai.Client(api_key=GEMINI_KEY)
 
-# ============================================================
-# 2. NARZĘDZIA DLA AI
-# ============================================================
+# tools
 def search_web(query: str) -> str:
     try:
         response = requests.post(
@@ -56,14 +53,12 @@ def scrape_page(url: str) -> str:
     except Exception as e:
         return f"SCRAPE ERROR ({url}): {str(e)}"
 
-# ============================================================
-# 3. SILNIK AGENTA Z WYMUSZENIEM JĘZYKA I WALUTY
-# ============================================================
-# Zmienione "DNA" agenta - wymusza angielski i konwersję walut
+# Agent's engine
+
 SYSTEM_INSTRUCTION = """You are a Global Market Intelligence AI.
 CRITICAL RULES:
 1. ALL your queries to the search engine MUST be in English to find global data.
-2. The final report MUST be written entirely in English.
+2. The final report MUST be shortly written entirely in English.
 3. You MUST convert all found prices to the user's requested Target Currency.
 4. Always provide sources in the format: (Source: URL).
 5. Use Markdown to create clean comparison tables."""
@@ -79,20 +74,20 @@ def generate_market_report(topic: str, target_currency: str) -> str:
         )
     )
     
-    # Przekazujemy wybraną walutę do polecenia
+    # exchange
     prompt = f"Conduct deep research on: **{topic}**. Output the report in English. IMPORTANT: Convert all pricing data to {target_currency} based on current estimated exchange rates. If you estimate a conversion, briefly mention it."
     
     response = chat.send_message(prompt)
     return response.text
 
-# ============================================================
-# 4. FRONTEND (Interfejs w języku angielskim)
-# ============================================================
-st.title("🌍 Global Market Intelligence AI")
+
+# FRONTEND 
+
+st.title("🌍 Market Analysis and Pricing Agent")
 st.markdown("Enter a company or product category. The AI will search the global web and calculate prices into your local currency.")
 
 with st.form(key="search_form"):
-    col1, col2 = st.columns([3, 1]) # Dzielimy interfejs na dwie kolumny
+    col1, col2 = st.columns([3, 1]) 
     
     with col1:
         topic_input = st.text_input(
@@ -101,7 +96,7 @@ with st.form(key="search_form"):
         )
     
     with col2:
-        # Rozwijane menu z walutami
+    
         selected_currency = st.selectbox(
             "Target Currency:", 
             ["USD ($)", "EUR (€)", "PLN (zł)", "GBP (£)", "AUD ($)", "CAD ($)"]
@@ -115,7 +110,6 @@ if submit_button:
     else:
         with st.spinner(f"🔍 Researching global data for '{topic_input}' and converting to {selected_currency}..."):
             try:
-                # Przekazujemy temat ORAZ walutę do funkcji
                 report_content = generate_market_report(topic_input, selected_currency)
                 
                 st.success("✅ Report generated successfully!")
