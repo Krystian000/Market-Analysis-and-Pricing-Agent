@@ -1,173 +1,134 @@
+import streamlit as st
 import os
-import sys
 import requests
-from datetime import datetime
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-from rich.console import Console
-from rich.markdown import Markdown
-
-
 from google import genai
 from google.genai import types
 
-# Wczytaj klucze
-load_dotenv()
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-TAVILY_KEY = os.getenv("TAVILY_API_KEY")
+# ============================================================
+# 1. KONFIGURACJA APLIKACJI (Zawsze na samej górze)
+# ============================================================
+st.set_page_config(
+    page_title="Market Intelligence AI", 
+    page_icon="📊", 
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
+
+# ============================================================
+# 2. AUTORYZACJA I ZARZĄDZANIE KLUCZAMI
+# ============================================================
+# Pobieramy klucze z chmury Streamlit (Secrets) lub z pliku lokalnego (.env)
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+TAVILY_KEY = st.secrets.get("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY"))
 
 if not GEMINI_KEY or not TAVILY_KEY:
-    print("BŁĄD: Brak kluczy w pliku .env (sprawdź GEMINI_API_KEY i TAVILY_API_KEY)")
-    sys.exit(1)
+    st.error("🚨 **Błąd krytyczny:** Brak kluczy API. Dodaj GEMINI_API_KEY oraz TAVILY_API_KEY w zakładce 'Secrets' na Streamlit Cloud.")
+    st.stop() # Zatrzymuje aplikację, żeby nie generowała kolejnych błędów
 
+# Inicjalizacja klienta tylko raz
 client = genai.Client(api_key=GEMINI_KEY)
 
 # ============================================================
-# NARZĘDZIA AGENTA
+# 3. ZOPTYMALIZOWANE NARZĘDZIA DLA AI
 # ============================================================
-
 def search_web(query: str) -> str:
-    """Wyszukaj w internecie aktualne informacje o firmach, produktach i cenach."""
+    """Wyszukuje informacje w sieci za pomocą Tavily API."""
     try:
         response = requests.post(
             "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_KEY, 
-                "query": query, 
-                "search_depth": "advanced",
-                "max_results": 4
-            },
-            timeout=20
+            json={"api_key": TAVILY_KEY, "query": query, "search_depth": "advanced", "max_results": 4},
+            timeout=15
         )
-        data = response.json()
-        results = [f"URL: {r['url']}\nTreść: {r.get('content', '')[:600]}" for r in data.get("results", [])]
-        return "\n---\n".join(results) or "Brak wyników wyszukiwania."
+        response.raise_for_status() # Wyrzuci błąd, jeśli API nie odpowie
+        
+        results = response.json().get("results", [])
+        formatted_results = [f"Źródło: {r['url']}\nFragment: {r.get('content', '')[:800]}" for r in results]
+        
+        return "\n---\n".join(formatted_results) if formatted_results else "Brak wyników."
     except Exception as e:
-        return f"BŁĄD wyszukiwania: {str(e)}"
+        return f"BŁĄD WYSZUKIWANIA: {str(e)}"
 
 def scrape_page(url: str) -> str:
-    """Pobierz dokładną treść strony internetowej (np. z cennikiem)."""
+    """Pobiera czysty tekst ze strony internetowej."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=15)
+        # Bardziej realistyczne nagłówki, by ominąć proste blokady anty-bot
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9,pl;q=0.8"
+        }
+        response = requests.get(url, headers=headers, timeout=12)
+        response.raise_for_status()
+        
         soup = BeautifulSoup(response.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer"]): 
+        
+        # Usuwamy elementy niepotrzebne do analizy tekstu
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]): 
             tag.decompose()
-        return soup.get_text(separator="\n", strip=True)[:4000]
+            
+        text = soup.get_text(separator=" ", strip=True)
+        return text[:4500] # Ograniczamy do 4500 znaków (optymalne dla kontekstu API)
     except Exception as e:
-        return f"BŁĄD pobierania strony: {str(e)}"
+        return f"BŁĄD SKRAPOWANIA ({url}): {str(e)}"
 
 # ============================================================
-# SYSTEM PROMPT — "DNA" AGENTA (ZMODYFIKOWANE)
+# 4. SILNIK AGENTA (Z pamięcią podręczną - Cache)
 # ============================================================
+SYSTEM_INSTRUCTION = """Jesteś analitykiem biznesowym (Market Intelligence).
+Twoim zadaniem jest analiza cen firm lub całych kategorii rynkowych.
+ZASADY:
+1. MUSISZ tworzyć czytelne tabele porównawcze.
+2. MUSISZ podawać w nawiasach źródła danych w formie (Źródło: URL).
+3. Pisz w sposób profesjonalny, konkretny, używając języka Markdown.
+4. Zwróć uwagę na ukryte koszty i haczyki w cennikach."""
 
-SYSTEM_INSTRUCTION = """Jesteś ekspertem ds. badań rynkowych i analitykiem cenowym.
-Twoim zadaniem jest analiza cenowa konkretnych firm LUB całych kategorii produktów/usług.
-
-JAK MASZ DZIAŁAĆ:
-1. Rozpoznaj intencję użytkownika:
-   - Jeśli to KATEGORIA (np. "filmy i seriale", "CRM", "narzędzia do księgowości"):
-     Najpierw wyszukaj 3-4 najpopularniejsze serwisy/firmy w tej kategorii, a potem znajdź i porównaj ich ceny.
-   - Jeśli to KONKRETNA FIRMA (np. "Netflix", "Notion"):
-     Znajdź jej szczegółowy cennik, a następnie wyszukaj jej głównych konkurentów, by zrobić porównanie.
-
-ZASADY KRYTYCZNE:
-- ZAWSZE podawaj źródła dla cen w formacie: (Źródło: URL).
-- ZAWSZE wygeneruj tabelę z porównaniem cen i funkcji.
-- Samodzielnie decyduj, jakich zapytań (queries) użyć w wyszukiwarce. Bądź dociekliwy.
-- Korzystaj z polskic cenników, preferuj oficjalne strony firm, jeśli nie znajdziesz szukaj też zagranicznych, ale spróbuj je przewalutować na PLN.
-
-FORMAT RAPORTU (Markdown):
-
-# Analiza Rynku / Cen: [Temat]
-**Data wygenerowania:** [Dzisiejsza data]
-
-## 💡 Podsumowanie Rynku
-[Krótki opis: jacy są główni gracze w tej kategorii lub z kim konkuruje podana firma]
-
-## 💰 Zestawienie Ofert (Tabela)
-| Firma/Usługa | Plan | Cena/mies | Główne cechy/limity | Źródło |
-|--------------|------|-----------|---------------------|--------|
-| ...          | ...  | ...       | ...                 | ...    |
-
-## 🕵️ Ukryte koszty i haczyki
-[Na co uważać? Np. opłaty za współdzielenie konta, reklamy w tanich planach, umowy roczne itp.]
-
-## ⚖️ Werdykt: Co i dla kogo?
-[Napisz, co wychodzi najtaniej, a co oferuje najwyższą jakość / premium]
-
-## 🔗 Źródła
-[Lista linków z których korzystałeś]
-"""
-
-# ============================================================
-# GŁÓWNA PĘTLA
-# ============================================================
-
-def run_agent(topic: str):
-    today = datetime.now().strftime("%d.%m.%Y")
-    
-    print(f"\n{'='*55}")
-    print(f"  🤖 Agent Badawczy (Gemini) analizuje: {topic}")
-    print(f"{'='*55}\n")
-
+# @st.cache_data sprawia, że pytania o ten sam temat nie zużywają limitów API
+@st.cache_data(ttl=3600, show_spinner=False)
+def generate_market_report(topic: str) -> str:
+    """Główna funkcja orkiestrująca AI, korzystająca z cache na 1 godzinę."""
     chat = client.chats.create(
         model="gemini-2.5-flash", 
         config=types.GenerateContentConfig(
             tools=[search_web, scrape_page],
             system_instruction=SYSTEM_INSTRUCTION,
-            temperature=0.2
+            temperature=0.1 # Niska temperatura = bardziej precyzyjne, mniej "halucynujące" dane
         )
     )
     
-    # Zmieniliśmy prompt na bardziej otwarty, dając agentowi wolną rękę w działaniu
-    prompt = (
-        f"Przeanalizuj temat: **{topic}**. Dzisiejsza data to {today}.\n"
-        "Samodzielnie używaj narzędzi (search_web, scrape_page) w optymalnej kolejności. "
-        "Zbierz solidne dane i wygeneruj pełny raport Markdown zgodnie z System Instruction."
+    prompt = f"Przeprowadź głęboki research i stwórz profesjonalny raport cenowy w Markdown dla: **{topic}**. Użyj dostępnych narzędzi."
+    response = chat.send_message(prompt)
+    return response.text
+
+# ============================================================
+# 5. FRONTEND (Interfejs Użytkownika)
+# ============================================================
+st.title("📊 AI Market Intelligence Agent")
+st.markdown("Wpisz interesującą Cię branżę lub firmę, a agent samodzielnie przeszuka sieć, przeczyta cenniki i wygeneruje przejrzysty raport.")
+
+# Używamy formularza, żeby uniknąć przypadkowych odświeżeń strony
+with st.form(key="search_form"):
+    topic_input = st.text_input(
+        "Temat analizy (firma lub kategoria):", 
+        placeholder="np. systemy CRM dla e-commerce, Netflix vs HBO..."
     )
+    submit_button = st.form_submit_button(label="🚀 Wygeneruj Raport", use_container_width=True)
 
-    try:
-        print("Trwa zbieranie danych i badanie rynku (to może zająć 20-30 sekund)...\n")
-        response = chat.send_message(prompt)
-        
-        os.makedirs("output", exist_ok=True)
-        safe_name = topic.replace(" ", "_").replace("/", "-")
-        date_str = datetime.now().strftime("%Y%m%d_%H%M")
-        filename = f"output/{safe_name}_Gemini_{date_str}.md"
-
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(response.text)
-
-        print(f"✅ GOTOWE! Raport zapisany: {filename}")
-        print(f"\n{'='*55}\nPODGLĄD RAPORTU:\n{'='*55}\n")
-        print(f"✅ GOTOWE! Raport zapisany: {filename}")
-        print(f"\n{'='*55}\nPODGLĄD RAPORTU:\n{'='*55}\n")
-        
-        # Magia biblioteki Rich - rysuje piękne tabele w terminalu!
-        console = Console()
-        md = Markdown(response.text)
-        console.print(md)
-
-    except Exception as e:
-        print(f"❌ Wystąpił błąd podczas działania agenta: {e}")
-        
-
-
-
-
-
-
-
-    except Exception as e:
-        print(f"❌ Wystąpił błąd podczas działania agenta: {e}")
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("\nJak używać w terminalu:")
-        print("  python agent.py \"Nazwa firmy\"   (np. python agent.py \"Netflix\")")
-        print("  python agent.py \"Kategoria\"     (np. python agent.py \"filmy i seriale platformy\")")
-        sys.exit(0)
-
-    topic = " ".join(sys.argv[1:])
-    run_agent(topic)
+# Logika po kliknięciu przycisku
+if submit_button:
+    if len(topic_input.strip()) < 2:
+        st.warning("Wpisz poprawny temat do przeanalizowania.")
+    else:
+        with st.spinner(f"🔍 Trwa badanie rynku dla: '{topic_input}'. To zajmie kilkanaście sekund..."):
+            try:
+                # Wywołanie zoptymalizowanej, cachowanej funkcji
+                report_content = generate_market_report(topic_input)
+                
+                st.success("✅ Raport został wygenerowany pomyślnie!")
+                
+                # Zgrabny kontener na wynik, by odróżniał się wizualnie
+                with st.container(border=True):
+                    st.markdown(report_content)
+                    
+            except Exception as e:
+                st.error(f"❌ Niestety wystąpił problem techniczny: {str(e)}")
+                st.info("Spróbuj sformułować zapytanie inaczej lub poczekaj chwilę przed kolejną próbą.")
